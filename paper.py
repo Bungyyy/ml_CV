@@ -747,8 +747,8 @@ if __name__ == "__main__":
     output_folder = "output"  # Base folder for outputs
     model_path = "best.pt"  # YOLO model path
     barcode_data_csv = "barcode_data.csv"  # CSV with expected values
-    results_csv = "barcode_result_improved.csv"  # Results CSV
-    debug_dir = "ocr_debug_improved"  # Debug images directory
+    results_csv = "barcode_result.csv"  # Results CSV
+    debug_dir = "ocr_debug"  # Debug images directory
     
     # Run the complete pipeline
     full_pipeline(
