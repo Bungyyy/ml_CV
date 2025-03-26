@@ -1,491 +1,762 @@
-import torch
-import torch.nn as nn
-import torchvision
-import numpy as np
-import cv2
 import os
+import cv2
+import numpy as np
+from pathlib import Path
+import csv
 import time
+import re
+import difflib
+import pytesseract
+from PIL import Image, ImageEnhance, ImageOps, ImageFilter
+from ultralytics import YOLO
 
-# Import the existing functions from read_barcode_data.py
-from read_barcode_data import (
-    process_image, recognize_barcode, recognize_three_segment_code,
-    enhance_image, normalize, fuzzy_match, correct_ocr_errors
-)
+# === Helper Functions ===
+def normalize(text):
+    """Normalize text by removing spaces and converting to uppercase"""
+    return re.sub(r'\s+', '', text).strip().upper()
 
-class SELayer(nn.Module):
-    """Squeeze-and-Excitation attention module as described in the paper"""
-    def __init__(self, channel, reduction=16):
-        super(SELayer, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(channel, channel // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(channel // reduction, channel, bias=False),
-            nn.Sigmoid()
+def fuzzy_match(a, b, threshold=0.85):
+    """Compare two strings and determine if they're a close enough match"""
+    if not a or not b:
+        return 0, False
+    
+    # Normalize both strings for comparison by removing all non-alphanumeric chars
+    a_norm = re.sub(r'[^A-Z0-9]', '', a.upper())
+    b_norm = re.sub(r'[^A-Z0-9]', '', b.upper())
+    
+    ratio = difflib.SequenceMatcher(None, a_norm, b_norm).ratio()
+    return ratio, ratio >= threshold
+
+def create_directory(directory_path):
+    """Create a directory if it doesn't exist."""
+    if not os.path.exists(directory_path):
+        os.makedirs(directory_path)
+        print(f"Created directory: {directory_path}")
+
+# === Enhanced Image Processing ===
+def enhance_image(img, is_barcode=False):
+    """Apply advanced image enhancement techniques"""
+    # Convert to grayscale if it's not already
+    if isinstance(img, np.ndarray) and len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    elif isinstance(img, Image.Image):
+        gray = ImageOps.grayscale(img)
+        gray = np.array(gray)
+    else:
+        gray = img  # Assume it's already grayscale
+    
+    # Apply different processing based on whether it's a barcode or text
+    if is_barcode:
+        # For barcodes: high contrast, thresholding, dilation to connect lines
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+        _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # Dilate horizontally for barcodes to connect broken lines
+        kernel = np.ones((1,2), np.uint8)
+        dilated = cv2.dilate(binary, kernel, iterations=1)
+        
+        return dilated
+    else:
+        # For text: moderate contrast enhancement, noise reduction, sharpening
+        # Apply bilateral filter for noise reduction while preserving edges
+        filtered = cv2.bilateralFilter(gray, 9, 75, 75)
+        
+        # Apply CLAHE for better contrast
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8,8))
+        enhanced = clahe.apply(filtered)
+        
+        # Sharpen the image
+        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+        sharpened = cv2.filter2D(enhanced, -1, kernel)
+        
+        # Adaptive thresholding for better text separation
+        binary = cv2.adaptiveThreshold(
+            sharpened, 
+            255, 
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 
+            11, 
+            2
         )
+        
+        return binary
 
-    def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
-        return x * y.expand_as(x)
+# === Barcode and Three-Segment Code Detection ===
+def split_image(img):
+    """Split the image into potential barcode and three-segment code regions"""
+    # Convert PIL to OpenCV if needed
+    if isinstance(img, Image.Image):
+        img = np.array(img)
+        if len(img.shape) == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    
+    # Get image dimensions
+    height, width = img.shape[:2]
+    
+    # Define regions based on typical placement
+    top_height = int(height * 0.25)  # Assume top 25% has the three-segment code
+    
+    # Barcode is often in the bottom portion
+    barcode_regions = [(0, top_height, width, height)]
+    
+    # Define the three-segment code region based on typical placement
+    # Usually at the top of the image
+    three_segment_regions = [(0, 0, width, top_height)]
+    
+    return barcode_regions, three_segment_regions
 
-class CSPBlock(nn.Module):
-    """Cross Stage Partial block for the network"""
-    def __init__(self, in_channels, out_channels):
-        super(CSPBlock, self).__init__()
-        self.part1_conv = nn.Conv2d(in_channels, out_channels // 2, kernel_size=1)
-        self.part2_conv = nn.Conv2d(in_channels, out_channels // 2, kernel_size=1)
-        self.res_conv = nn.Sequential(
-            nn.Conv2d(out_channels // 2, out_channels // 2, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels // 2),
-            nn.LeakyReLU(0.1, inplace=True)
+# === Recognition Functions ===
+def recognize_barcode(image, expected_barcode=""):
+    """Extract barcode from image using OCR"""
+    # Convert PIL to NumPy if needed
+    if isinstance(image, Image.Image):
+        image = np.array(image)
+        if len(image.shape) == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    
+    # Enhance the image for barcode detection
+    enhanced = enhance_image(image, is_barcode=True)
+    
+    # Use multiple approaches to read the barcode
+    decoded_barcode = ""
+    ocr_results = []
+    
+    # Try different tesseract configurations
+    try:
+        # PSM 6 - Assume a single uniform block of text
+        ocr_text_6 = pytesseract.image_to_string(
+            enhanced, 
+            config='--psm 6 -c tessedit_char_whitelist=TH0123456789'
         )
-        self.final_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1)
+        ocr_results.append(ocr_text_6)
         
-    def forward(self, x):
-        part1 = self.part1_conv(x)
-        part2 = self.part2_conv(x)
-        part2 = self.res_conv(part2)
-        out = torch.cat([part1, part2], dim=1)
-        return self.final_conv(out)
-
-class CSP_SPP(nn.Module):
-    """CSP modular SPP structure as described in the paper"""
-    def __init__(self, in_channels, out_channels):
-        super(CSP_SPP, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, in_channels // 2, kernel_size=1)
-        self.conv2 = nn.Conv2d(in_channels, in_channels // 2, kernel_size=1)
-        self.conv3 = nn.Conv2d(in_channels // 2, in_channels // 2, kernel_size=3, padding=1)
-        self.conv4 = nn.Conv2d(in_channels // 2, in_channels // 2, kernel_size=1)
+        # PSM 7 - Treat the image as a single text line
+        ocr_text_7 = pytesseract.image_to_string(
+            enhanced, 
+            config='--psm 7 -c tessedit_char_whitelist=TH0123456789'
+        )
+        ocr_results.append(ocr_text_7)
         
-        # SPP block (Spatial Pyramid Pooling)
-        self.maxpool1 = nn.MaxPool2d(kernel_size=5, stride=1, padding=2)
-        self.maxpool2 = nn.MaxPool2d(kernel_size=9, stride=1, padding=4)
-        self.maxpool3 = nn.MaxPool2d(kernel_size=13, stride=1, padding=6)
-        
-        self.conv5 = nn.Conv2d(in_channels * 2, in_channels // 2, kernel_size=1)
-        self.conv_final = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-        
-    def forward(self, x):
-        # Split the input
-        x1 = self.conv1(x)
-        x2 = self.conv2(x)
-        
-        # Process x2 through the SPP path
-        x2 = self.conv3(x2)
-        x2 = self.conv4(x2)
-        
-        # Apply SPP module
-        spp_out = torch.cat([
-            x2,
-            self.maxpool1(x2),
-            self.maxpool2(x2),
-            self.maxpool3(x2)
-        ], dim=1)
-        
-        x2 = self.conv5(spp_out)
-        
-        # Concatenate and apply final convolution
-        out = torch.cat([x1, x2], dim=1)
-        return self.conv_final(out)
-
-class SCS_YOLOv4(nn.Module):
-    """SCS-YOLOv4 model as described in the paper"""
-    def __init__(self, num_classes=2):  # Two classes: barcode and three-segment code
-        super(SCS_YOLOv4, self).__init__()
-        
-        # Use CSPDarknet53 as backbone (simplified representation)
-        self.backbone = torchvision.models.resnet50(pretrained=True)
-        self.backbone_features = nn.Sequential(*list(self.backbone.children())[:-2])
-        
-        # CSP-SPP module
-        self.csp_spp = CSP_SPP(2048, 1024)
-        
-        # SE attention modules
-        self.se1 = SELayer(1024)
-        self.se2 = SELayer(512)
-        self.se3 = SELayer(256)
-        
-        # Feature Pyramid Network (FPN)
-        self.lateral_conv1 = nn.Conv2d(2048, 256, kernel_size=1)
-        self.lateral_conv2 = nn.Conv2d(1024, 256, kernel_size=1)
-        self.lateral_conv3 = nn.Conv2d(512, 256, kernel_size=1)
-        
-        self.fpn_conv1 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
-        self.fpn_conv2 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
-        self.fpn_conv3 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
-        
-        # Detection heads
-        self.head1 = nn.Conv2d(256, num_classes * 25, kernel_size=1)  # For small objects
-        self.head2 = nn.Conv2d(256, num_classes * 25, kernel_size=1)  # For medium objects
-        self.head3 = nn.Conv2d(256, num_classes * 25, kernel_size=1)  # For large objects
-        
-    def forward(self, x):
-        # Backbone features
-        c3, c4, c5 = self.extract_features(x)
-        
-        # Apply CSP-SPP to C5
-        p5 = self.csp_spp(c5)
-        p5 = self.se1(p5)
-        
-        # FPN top-down pathway with proper channel projection
-        # First, use lateral convolutions to project all feature maps to the same channel dimension
-        lateral_p5 = self.lateral_conv1(p5)  # Project p5 to 256 channels
-        lateral_c4 = self.lateral_conv2(c4)  # Project c4 to 256 channels
-        lateral_c3 = self.lateral_conv3(c3)  # Project c3 to 256 channels
-        
-        # Upsample p5 and add to c4
-        p5_upsampled = nn.functional.interpolate(lateral_p5, size=c4.shape[2:], mode='nearest')
-        p4 = lateral_c4 + p5_upsampled
-        p4 = self.fpn_conv2(p4)
-        p4 = self.se2(p4)
-        
-        # Upsample p4 and add to c3
-        p4_upsampled = nn.functional.interpolate(p4, size=c3.shape[2:], mode='nearest')
-        p3 = lateral_c3 + p4_upsampled
-        p3 = self.fpn_conv3(p3)
-        p3 = self.se3(p3)
-        
-        # Detection heads
-        d3 = self.head1(p3)  # Small objects (e.g., smaller barcodes)
-        d4 = self.head2(p4)  # Medium objects
-        d5 = self.head3(p5)  # Large objects (e.g., larger three-segment codes)
-        
-        return [d3, d4, d5]
+        # Try inverting the image if we didn't get good results
+        if not any("TH" in result for result in ocr_results):
+            inverted = cv2.bitwise_not(enhanced)
+            ocr_text_inv = pytesseract.image_to_string(
+                inverted, 
+                config='--psm 6 -c tessedit_char_whitelist=TH0123456789'
+            )
+            ocr_results.append(ocr_text_inv)
+    except Exception as e:
+        print(f"OCR error: {str(e)}")
     
-    def extract_features(self, x):
-        """Extract features from the backbone network"""
-        # This is a simplified version, actual implementation would extract 
-        # features from different levels of CSPDarknet53
-        x = self.backbone_features(x)
-        
-        # Simulate extraction of features from different stages
-        # In a real implementation, these would be taken from different layers of CSPDarknet53
-        c3 = torch.randn(x.shape[0], 512, x.shape[2]*2, x.shape[3]*2)
-        c4 = torch.randn(x.shape[0], 1024, x.shape[2], x.shape[3])
-        c5 = x  # 2048 channels
-        
-        return c3, c4, c5
-
-
-class ParcelSortingSystem:
-    """Main class implementing the express parcel sorting system described in the paper"""
-    def __init__(self, model_path=None, device="cpu"):
-        self.device = device
-        
-        # Flag to indicate if we're using the deep model
-        self.use_deep_model = False
-        
-        # Only initialize the model if a valid path is provided to avoid errors
-        if model_path and os.path.exists(model_path):
-            self.use_deep_model = True
-            # Initialize the SCS-YOLOv4 model
-            self.model = SCS_YOLOv4(num_classes=2)
-            # Load pre-trained weights
-            self.model.load_state_dict(torch.load(model_path, map_location=device))
-            self.model.to(device)
-            self.model.eval()
-        else:
-            print("No model path provided or model not found. Using traditional image splitting approach.")
-    
-    def detect_regions(self, image):
-        """Detect barcode and three-segment code regions in the image"""
-        # Instead of using the model which has architecture issues,
-        # we'll fall back to the original image splitting approach for now
-        # This ensures the code works while you implement the proper model
-        
-        # Get image dimensions
-        height, width = image.shape[:2]
-        
-        # Define regions based on typical placement (as in the original code)
-        top_height = int(height * 0.25)  # Assume top 25% has the three-segment code
-        
-        # Barcode is often in the bottom portion
-        barcode_regions = [(0, top_height, width, height)]
-        
-        # Define the three-segment code region based on typical placement
-        # Usually at the top of the image
-        three_segment_regions = [(0, 0, width, top_height)]
-        
-        return barcode_regions, three_segment_regions
-    
-    def process_image(self, image_path, expected_barcode="", expected_code="", debug_dir=None):
-        """Process an image to identify barcode and three-segment code"""
-        start_time_total = time.time()
-        try:
-            # Load the image
-            load_start = time.time()
-            if isinstance(image_path, str):
-                img = cv2.imread(image_path)
-                if img is None:
-                    raise ValueError(f"Could not load image: {image_path}")
-            else:
-                img = image_path
-            load_time = time.time() - load_start
+    # Process OCR results
+    for result in ocr_results:
+        for line in result.splitlines():
+            line_clean = normalize(line)
             
-            # Detect regions using SCS-YOLOv4 or traditional approach
-            detect_start = time.time()
-            barcode_regions, three_segment_regions = self.detect_regions(img)
-            detect_time = time.time() - detect_start
-            
-            # Process barcode regions
-            barcode_start = time.time()
-            barcode_result = ""
-            barcode_sim = 0
-            
-            for region in barcode_regions:
-                x1, y1, x2, y2 = region
-                barcode_img = img[y1:y2, x1:x2]
-                
-                # Save debug image if directory specified
-                if debug_dir:
-                    os.makedirs(debug_dir, exist_ok=True)
-                    debug_filename = os.path.basename(image_path) if isinstance(image_path, str) else "debug_barcode.png"
-                    enhanced = enhance_image(barcode_img, is_barcode=True)
-                    cv2.imwrite(os.path.join(debug_dir, f"barcode_{debug_filename}"), enhanced)
-                
-                # Recognize barcode
-                result, sim = recognize_barcode(barcode_img, expected_barcode)
-                
-                # Keep the best result
-                if sim > barcode_sim or not barcode_result:
-                    barcode_result = result
-                    barcode_sim = sim
-            barcode_time = time.time() - barcode_start
-            
-            # Process three-segment code regions
-            threecode_start = time.time()
-            code_result = ""
-            code_sim = 0
-            
-            for region in three_segment_regions:
-                x1, y1, x2, y2 = region
-                code_img = img[y1:y2, x1:x2]
-                
-                # Save debug image if directory specified
-                if debug_dir:
-                    os.makedirs(debug_dir, exist_ok=True)
-                    debug_filename = os.path.basename(image_path) if isinstance(image_path, str) else "debug_three_segment.png"
-                    enhanced = enhance_image(code_img, is_barcode=False)
-                    cv2.imwrite(os.path.join(debug_dir, f"text_{debug_filename}"), enhanced)
-                
-                # Recognize three-segment code
-                result, sim = recognize_three_segment_code(code_img, expected_code)
-                
-                # Keep the best result
-                if sim > code_sim or not code_result:
-                    code_result = result
-                    code_sim = sim
-            threecode_time = time.time() - threecode_start
-            
-            # Determine status
-            barcode_ok = barcode_sim >= 0.85
-            barcode_status = "✅" if barcode_ok else "❌"
-            
-            if len(code_result) < 3:
-                code_status = "⚠️ Missing"
-            elif code_sim >= 0.95:
-                code_status = "✅"
-            elif code_sim >= 0.85:
-                code_status = "⚠️ Close"
-            else:
-                code_status = "❌"
-            
-            total_time = time.time() - start_time_total
-            
-            # Print timing information
-            print(f"⏱️ Timing for {os.path.basename(image_path) if isinstance(image_path, str) else 'image'}:")
-            print(f"  - Load image: {load_time:.3f}s")
-            print(f"  - Detect regions: {detect_time:.3f}s")
-            print(f"  - Barcode recognition: {barcode_time:.3f}s")
-            print(f"  - Three-code recognition: {threecode_time:.3f}s")
-            print(f"  - Total processing: {total_time:.3f}s")
-            
-            return {
-                "barcode": barcode_result,
-                "three_segment_code": code_result,
-                "barcode_status": barcode_status,
-                "code_status": code_status,
-                "barcode_sim": barcode_sim,
-                "code_sim": code_sim,
-                "timing": {
-                    "load": load_time,
-                    "detect": detect_time,
-                    "barcode": barcode_time,
-                    "threecode": threecode_time,
-                    "total": total_time
+            # Typical barcode starts with TH and is followed by numbers
+            if "TH" in line_clean:
+                # Apply OCR corrections
+                corrected = line_clean
+                # Common OCR corrections
+                corrections = {
+                    'O': '0',  # O → 0
+                    'I': '1',  # I → 1
+                    'Z': '2',  # Z → 2
+                    'Q': '0',  # Q → 0
+                    'D': '0',  # D → 0 (similar shapes)
                 }
-            }
-            
-        except Exception as e:
-            print(f"Error processing image {image_path}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return {
-                "barcode": "⚠️ Error",
-                "three_segment_code": "⚠️ Error",
-                "barcode_status": "❌",
-                "code_status": "❌",
-                "barcode_sim": 0.0,
-                "code_sim": 0.0,
-                "timing": {
-                    "load": 0.0,
-                    "detect": 0.0,
-                    "barcode": 0.0,
-                    "threecode": 0.0,
-                    "total": time.time() - start_time_total
-                }
-            }
+                for bad, good in corrections.items():
+                    corrected = corrected.replace(bad, good)
+                
+                # If we have an expected barcode, compare similarity
+                if expected_barcode:
+                    ratio, _ = fuzzy_match(corrected, expected_barcode, 0)
+                    if ratio > 0.7:  # Accept if reasonably similar
+                        decoded_barcode = corrected
+                        break
+                else:
+                    # Without expected barcode, just take the first valid one
+                    decoded_barcode = corrected
+                    break
     
-    def process_batch(self, input_csv, output_csv, debug_dir=None):
-        """Process a batch of images based on entries in a CSV file"""
-        import csv
+    # Calculate similarity
+    barcode_sim = 0
+    if decoded_barcode and expected_barcode:
+        barcode_sim, _ = fuzzy_match(decoded_barcode, expected_barcode)
+    
+    return decoded_barcode, barcode_sim
+
+def recognize_three_segment_code(image, expected_code=""):
+    """Extract three-segment code from image using OCR"""
+    # Convert PIL to NumPy if needed
+    if isinstance(image, Image.Image):
+        image = np.array(image)
+        if len(image.shape) == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    
+    # Enhance the image for text recognition
+    enhanced = enhance_image(image, is_barcode=False)
+    
+    # Try multiple OCR approaches
+    potential_codes = []
+    
+    try:
+        # Try different PSM modes
+        psm_modes = [6, 7, 8, 11]
         
-        # Initialize list to store timing results
-        self.timing_results = []
-        print("Debug: Initialized empty timing_results list")
+        for psm in psm_modes:
+            ocr_text = pytesseract.image_to_string(
+                enhanced, 
+                config=f'--psm {psm} -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_. '
+            )
+            
+            lines = [line.strip() for line in ocr_text.splitlines() if line.strip()]
+            for line in lines:
+                # Look for patterns that match three-segment code
+                if "-" in line or len(line) >= 8:
+                    potential_codes.append(line)
+                
+                # Try pattern matching
+                pattern = r'([A-Z0-9]{3})[\s\-_.]+([A-Z0-9]{4})[\s\-_.]+([A-Z0-9]{3})'
+                match = re.search(pattern, line.upper())
+                if match:
+                    extracted = f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+                    potential_codes.append(extracted)
+    except Exception as e:
+        print(f"OCR error: {str(e)}")
+    
+    # Choose the best match from potential codes
+    decoded_code = ""
+    best_match_ratio = 0
+    
+    if expected_code:
+        # If we have an expected code, compare and find best match
+        for code in potential_codes:
+            code_clean = normalize(code)
+            ratio, _ = fuzzy_match(code_clean, expected_code, 0)
+            if ratio > best_match_ratio:
+                best_match_ratio = ratio
+                decoded_code = code_clean
+    else:
+        # Without expected code, take the first one that looks like XXX-XXXX-XXX
+        for code in potential_codes:
+            if re.search(r'[A-Z0-9]{3}-[A-Z0-9]{4}-[A-Z0-9]{3}', code):
+                decoded_code = normalize(code)
+                break
         
-        with open(input_csv, newline='') as infile, open(output_csv, mode='w', newline='') as outfile:
-            reader = csv.DictReader(infile)
-            writer = csv.writer(outfile)
+        # If no well-formatted code found, just take the first one
+        if not decoded_code and potential_codes:
+            decoded_code = normalize(potential_codes[0])
+    
+    # Calculate similarity
+    code_sim = 0
+    if decoded_code and expected_code:
+        code_sim, _ = fuzzy_match(decoded_code, expected_code)
+    
+    return decoded_code, code_sim
 
-            writer.writerow([
-                "Filename",
-                "Expected Barcode",
-                "Expected 3Code",
-                "Decoded Barcode",
-                "Decoded 3Code",
-                "Match Barcode",
-                "Match 3Code",
-                "Similarity Barcode",
-                "Similarity 3Code",
-                "Total Time (s)",
-                "Load Time (s)",
-                "Detect Time (s)",
-                "Barcode Time (s)",
-                "ThreeCode Time (s)"
-            ])
+# === YOLO Detection Function (from yolo_detect_all.py) ===
+def detect_and_save_images(input_folder, output_folder, model_path, debug_dir=None):
+    """
+    Detect objects in all images in a folder using YOLO and save the results.
+    
+    Parameters:
+    - input_folder: Path to folder containing input images
+    - output_folder: Path to folder for saving output images with bounding boxes
+    - model_path: Path to model weights
+    - debug_dir: Directory for saving debug images
+    
+    Returns:
+    - A list of detected image paths
+    """
+    # Create output folders
+    create_directory(output_folder)
+    if debug_dir:
+        yolo_debug_dir = os.path.join(debug_dir, "yolo_detections")
+        create_directory(yolo_debug_dir)
+    else:
+        yolo_debug_dir = None
+    
+    # Load model
+    model = YOLO(model_path)
+    
+    # Get list of image files in the input folder
+    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff']
+    image_files = []
+    for ext in image_extensions:
+        image_files.extend(list(Path(input_folder).glob(f"*{ext}")))
+        image_files.extend(list(Path(input_folder).glob(f"*{ext.upper()}")))
+    
+    if not image_files:
+        print(f"No images found in {input_folder}")
+        return []
+    
+    print(f"Found {len(image_files)} images to process with YOLO")
+    
+    # Process each image
+    detected_images = []
+    for image_path in image_files:
+        image_file = os.path.basename(image_path)
+        
+        # Construct output paths
+        output_path = os.path.join(output_folder, image_file)
+        
+        # Perform prediction
+        results = model.predict(str(image_path))
+        
+        # Access first result
+        result = results[0]
+        
+        # Save with bounding boxes
+        result.save(filename=output_path)
+        
+        # Also save to debug directory if specified
+        if yolo_debug_dir:
+            debug_path = os.path.join(yolo_debug_dir, image_file)
+            result.save(filename=debug_path)
+        
+        detected_images.append(output_path)
+        print(f"YOLO Detection: {image_file}")
+    
+    return detected_images
 
-            success_count = 0
-            barcode_success_count = 0
-            total_count = 0
+# === YOLO Crop Function (from yolo_crop_target.py) ===
+def crop_objects(input_folder, output_folder, model_path, target_class="Target", debug_dir=None):
+    """
+    Process all images in a folder, detect objects labeled with the target class,
+    crop them, and save to output folder.
+    
+    Parameters:
+    - input_folder: Path to folder containing input images
+    - output_folder: Path to folder for saving cropped objects
+    - model_path: Path to model weights
+    - target_class: Class name to detect and crop
+    - debug_dir: Directory for saving debug images
+    
+    Returns:
+    - A list of cropped image paths
+    """
+    # Create output folders
+    create_directory(output_folder)
+    if debug_dir:
+        crop_debug_dir = os.path.join(debug_dir, "cropped_targets")
+        create_directory(crop_debug_dir)
+    else:
+        crop_debug_dir = None
+    
+    # Load YOLOv model
+    model = YOLO(model_path)
+    
+    # Get image files
+    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']
+    image_files = []
+    for ext in image_extensions:
+        image_files.extend(list(Path(input_folder).glob(f"*{ext}")))
+        image_files.extend(list(Path(input_folder).glob(f"*{ext.upper()}")))
+    
+    if not image_files:
+        print(f"No images found in {input_folder}")
+        return []
+    
+    print(f"Found {len(image_files)} images to process for cropping")
+    
+    # Process each image
+    target_count = 0
+    cropped_images = []
+    
+    for img_path in image_files:
+        img_name = os.path.basename(img_path)
+        print(f"Processing for crop: {img_name}")
+        
+        # Read the image
+        img = cv2.imread(str(img_path))
+        if img is None:
+            print(f"Error reading image: {img_path}")
+            continue
+        
+        # Run inference
+        results = model(img)
+        
+        # Process results
+        result = results[0]  # Get the first result
+        
+        # Get bounding boxes, confidence scores, and class names
+        boxes = result.boxes
+        
+        # Find all objects with the target class
+        target_indices = []
+        for i, cls in enumerate(boxes.cls):
+            class_name = result.names[int(cls)]
+            if class_name.lower() == target_class.lower():
+                target_indices.append(i)
+        
+        if not target_indices:
+            print(f"No '{target_class}' found in {img_name}")
+            continue
+        
+        # Crop and save each target object
+        for idx, target_idx in enumerate(target_indices):
+            # Get bounding box coordinates (x1, y1, x2, y2)
+            box = boxes.xyxy[target_idx].cpu().numpy().astype(int)
+            conf = float(boxes.conf[target_idx])
+            
+            # Ensure coordinates are within image boundaries
+            height, width = img.shape[:2]
+            x1, y1, x2, y2 = box
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(width, x2)
+            y2 = min(height, y2)
+            
+            # Crop the image
+            cropped_img = img[y1:y2, x1:x2]
+            
+            if cropped_img.size == 0:
+                print(f"Warning: Empty crop in {img_name} at {box}")
+                continue
+            
+            # Save the cropped image
+            base_name = os.path.splitext(img_name)[0]
+            output_name = f"{base_name}_{target_class}_{idx}_{conf:.2f}.jpg"
+            output_path = os.path.join(output_folder, output_name)
+            cv2.imwrite(output_path, cropped_img)
+            
+            # Also save to debug directory if specified
+            if crop_debug_dir:
+                debug_path = os.path.join(crop_debug_dir, output_name)
+                cv2.imwrite(debug_path, cropped_img)
+            
+            cropped_images.append(output_path)
+            target_count += 1
+            print(f"Saved crop: {output_name}")
+    
+    print(f"Cropping complete. Found and saved {target_count} '{target_class}' objects.")
+    return cropped_images
 
+# === Process Cropped Images Function (matches barcodes from cropped images) ===
+def process_cropped_images(cropped_folder, output_csv, barcode_data_csv, debug_dir=None):
+    """
+    Process cropped images and match with barcode_data.csv by barcode only:
+    1. Read all images in cropped folder
+    2. Extract barcode and three-segment code from each
+    3. Match with entries in barcode_data.csv by barcode value
+    4. Write results to CSV
+    
+    Args:
+        cropped_folder: Folder containing cropped images
+        output_csv: Path to save results
+        barcode_data_csv: CSV with expected barcode and code values
+        debug_dir: Optional directory for saving debug images
+    """
+    # Create debug directory if needed
+    if debug_dir:
+        barcode_debug_dir = os.path.join(debug_dir, "barcode_extraction")
+        create_directory(barcode_debug_dir)
+    
+    # Read barcode data from CSV (indexed by barcode/tracking number)
+    expected_data = {}
+    try:
+        with open(barcode_data_csv, newline='') as csvfile:
+            reader = csv.DictReader(csvfile)
             for row in reader:
-                total_count += 1
-                expected_barcode = normalize(row['Tracking Number'])
-                expected_code = normalize(row['Three-Code'])
-                img_path = row["Filename"]
-
-                start_time = time.time()
-                
-                try:
-                    result = self.process_image(img_path, expected_barcode, expected_code, debug_dir)
-                    
-                    processing_time = time.time() - start_time
-                    
-                    barcode_ok = result["barcode_status"] == "✅"
-                    code_ok = result["code_status"] == "✅"
-                    
-                    if barcode_ok:
-                        barcode_success_count += 1
-                    if code_ok:
-                        success_count += 1
-                    
-                    writer.writerow([
-                        img_path,
-                        expected_barcode,
-                        expected_code,
-                        result["barcode"],
-                        result["three_segment_code"],
-                        result["barcode_status"],
-                        result["code_status"],
-                        f"{result['barcode_sim']:.2f}",
-                        f"{result['code_sim']:.2f}",
-                        f"{result['timing']['total']:.2f}",
-                        f"{result['timing']['load']:.2f}",
-                        f"{result['timing']['detect']:.2f}",
-                        f"{result['timing']['barcode']:.2f}",
-                        f"{result['timing']['threecode']:.2f}"
-                    ])
-                    
-                    # Debug print to see timing data structure
-                    print(f"Debug: Adding timing data for {os.path.basename(img_path)}: {result['timing']}")
-                    
-                    # Store timing results for statistics (only if successful)
-                    if 'timing' in result:
-                        # Store timing data with a flat structure
-                        self.timing_results.append({
-                            'load': result['timing']['load'],
-                            'detect': result['timing']['detect'],
-                            'barcode': result['timing']['barcode'],
-                            'threecode': result['timing']['threecode'],
-                            'total': result['timing']['total']
-                        })
-                        print(f"Debug: timing_results now has {len(self.timing_results)} entries")
-                    else:
-                        print(f"Warning: No timing information available for {img_path}")
-                    
-                    print(f"[{result['barcode_status']}|{result['code_status']}] {os.path.basename(img_path)}: {expected_barcode} → {result['barcode']} | {expected_code} → {result['three_segment_code']}")
-                    
-                except Exception as e:
-                    try:
-                        processing_time = time.time() - start_time
-                        writer.writerow([
-                            img_path,
-                            expected_barcode,
-                            expected_code,
-                            "⚠️ Error",
-                            "⚠️ Error",
-                            "❌",
-                            "❌",
-                            "0.00",
-                            "0.00",
-                            f"{processing_time:.2f}",
-                            "0.00",
-                            "0.00",
-                            "0.00",
-                            "0.00"
-                        ])
-                        print(f"[⚠️] {img_path} → {str(e)}")
-                    except Exception as e2:
-                        print(f"[⚠️⚠️] Critical error while handling error for {img_path}: {str(e2)}")
-
-            # Calculate success rates and average timings
-            barcode_success_rate = (barcode_success_count / total_count) * 100 if total_count > 0 else 0
-            three_code_success_rate = (success_count / total_count) * 100 if total_count > 0 else 0
-            
-            # Calculate average timing information (excluding errors)
-            avg_total_time = sum(result['total'] for result in self.timing_results) / len(self.timing_results) if self.timing_results else 0
-            avg_load_time = sum(result['load'] for result in self.timing_results) / len(self.timing_results) if self.timing_results else 0
-            avg_detect_time = sum(result['detect'] for result in self.timing_results) / len(self.timing_results) if self.timing_results else 0
-            avg_barcode_time = sum(result['barcode'] for result in self.timing_results) / len(self.timing_results) if self.timing_results else 0
-            avg_threecode_time = sum(result['threecode'] for result in self.timing_results) / len(self.timing_results) if self.timing_results else 0
-
-            
-            print(f"\n📄 Analysis and export complete: {output_csv} ✅")
-            print(f"📊 Barcode Success Rate: {barcode_success_count}/{total_count} ({barcode_success_rate:.1f}%)")
-            print(f"📊 Three-Segment Code Success Rate: {success_count}/{total_count} ({three_code_success_rate:.1f}%)")
-            print(f"\n⏱️ Average Processing Times:")
-            print(f"  - Load image: {avg_load_time:.3f}s")
-            print(f"  - Detect regions: {avg_detect_time:.3f}s")
-            print(f"  - Barcode recognition: {avg_barcode_time:.3f}s")
-            print(f"  - Three-code recognition: {avg_threecode_time:.3f}s")
-            print(f"  - Total processing: {avg_total_time:.3f}s")
-
-
-# Example usage
-if __name__ == "__main__":
-    # Initialize the system
-    sorting_system = ParcelSortingSystem(model_path="scs_yolov4_model.pth")
+                barcode = normalize(row['Tracking Number'])
+                expected_data[barcode] = {
+                    'three_code': normalize(row['Three-Code'])
+                }
+        print(f"Loaded {len(expected_data)} barcodes from {barcode_data_csv}")
+    except Exception as e:
+        print(f"Error reading CSV: {str(e)}")
+        return
     
-    # Process a batch of images
-    input_csv = "barcode_data.csv"
-    output_csv = "barcode_result_improved.csv"
-    debug_dir = "ocr_debug_improved"
+    # Get all cropped images
+    image_files = []
+    for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']:
+        image_files.extend(list(Path(cropped_folder).glob(f"*{ext}")))
+        image_files.extend(list(Path(cropped_folder).glob(f"*{ext.upper()}")))
+    
+    if not image_files:
+        print(f"No images found in {cropped_folder}")
+        return
+    
+    print(f"Found {len(image_files)} cropped images to process")
+    
+    # Create results CSV
+    with open(output_csv, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow([
+            "Image",
+            "Detected Barcode",
+            "Matched Barcode",
+            "Expected Three-Code",
+            "Detected Three-Code",
+            "Barcode Match",
+            "Three-Code Match",
+            "Processing Time (s)"
+        ])
+        
+        # Track statistics
+        total_count = len(image_files)
+        barcode_match_count = 0
+        code_match_count = 0
+        overall_success_count = 0
+        
+        # Process each image
+        for img_path in image_files:
+            img_name = os.path.basename(img_path)
+            print(f"Processing: {img_name}")
+            
+            start_time = time.time()
+            
+            try:
+                # Read the image
+                img = cv2.imread(str(img_path))
+                if img is None:
+                    raise ValueError(f"Could not read image: {img_path}")
+                
+                # Create debug dir for this image
+                img_debug_dir = None
+                if barcode_debug_dir:
+                    img_debug_dir = os.path.join(barcode_debug_dir, os.path.splitext(img_name)[0])
+                    create_directory(img_debug_dir)
+                
+                # Split image into barcode and three-segment code regions
+                barcode_regions, three_code_regions = split_image(img)
+                
+                # Process barcode regions
+                detected_barcode = ""
+                barcode_sim = 0
+                
+                for region in barcode_regions:
+                    x1, y1, x2, y2 = map(int, region)
+                    
+                    # Ensure coordinates are within image bounds
+                    height, width = img.shape[:2]
+                    x1 = max(0, x1)
+                    y1 = max(0, y1)
+                    x2 = min(width, x2)
+                    y2 = min(height, y2)
+                    
+                    # Extract region
+                    barcode_img = img[y1:y2, x1:x2]
+                    
+                    # Save debug image if needed
+                    if img_debug_dir:
+                        cv2.imwrite(os.path.join(img_debug_dir, "barcode_region.jpg"), barcode_img)
+                        enhanced = enhance_image(barcode_img, is_barcode=True)
+                        cv2.imwrite(os.path.join(img_debug_dir, "enhanced_barcode.jpg"), enhanced)
+                    
+                    # Try to recognize barcode
+                    barcode, _ = recognize_barcode(barcode_img)
+                    
+                    if barcode and barcode.startswith("TH"):
+                        detected_barcode = barcode
+                        break
+                
+                # Try to match detected barcode with expected barcodes
+                matched_barcode = ""
+                expected_code = ""
+                
+                if detected_barcode:
+                    # Try exact match first
+                    if detected_barcode in expected_data:
+                        matched_barcode = detected_barcode
+                        expected_code = expected_data[detected_barcode]['three_code']
+                    else:
+                        # Try fuzzy matching
+                        best_match = ""
+                        best_sim = 0
+                        for exp_barcode, data in expected_data.items():
+                            sim, _ = fuzzy_match(detected_barcode, exp_barcode, 0.8)
+                            if sim > best_sim:
+                                best_sim = sim
+                                best_match = exp_barcode
+                        
+                        # If good enough match found
+                        if best_sim >= 0.85:
+                            matched_barcode = best_match
+                            expected_code = expected_data[best_match]['three_code']
+                            barcode_sim = best_sim
+                
+                # Process three-segment code regions
+                detected_code = ""
+                code_sim = 0
+                
+                for region in three_code_regions:
+                    x1, y1, x2, y2 = map(int, region)
+                    
+                    # Ensure coordinates are within image bounds
+                    height, width = img.shape[:2]
+                    x1 = max(0, x1)
+                    y1 = max(0, y1)
+                    x2 = min(width, x2)
+                    y2 = min(height, y2)
+                    
+                    # Extract region
+                    code_img = img[y1:y2, x1:x2]
+                    
+                    # Save debug image if needed
+                    if img_debug_dir:
+                        cv2.imwrite(os.path.join(img_debug_dir, "code_region.jpg"), code_img)
+                        enhanced = enhance_image(code_img, is_barcode=False)
+                        cv2.imwrite(os.path.join(img_debug_dir, "enhanced_code.jpg"), enhanced)
+                    
+                    # Try to recognize three-segment code with expected code
+                    code, sim = recognize_three_segment_code(code_img, expected_code)
+                    
+                    if code:
+                        detected_code = code
+                        code_sim = sim
+                        break
+                
+                # Determine match status
+                processing_time = time.time() - start_time
+                
+                # Determine if barcode matched
+                barcode_match = "❌"
+                if matched_barcode:
+                    barcode_match = "✅"
+                    barcode_match_count += 1
+                
+                # Determine if three-segment code matched
+                code_match = "❌"
+                if matched_barcode and detected_code:
+                    # Compare with expected code
+                    if expected_code and code_sim >= 0.85:
+                        code_match = "✅"
+                        code_match_count += 1
+                
+                # Count overall success
+                if barcode_match == "✅" and code_match == "✅":
+                    overall_success_count += 1
+                
+                # Write results to CSV
+                writer.writerow([
+                    img_name,
+                    detected_barcode,
+                    matched_barcode,
+                    expected_code,
+                    detected_code,
+                    barcode_match,
+                    code_match,
+                    f"{processing_time:.2f}"
+                ])
+                
+                # Log to console
+                print(f"[{barcode_match}|{code_match}] {img_name}")
+                print(f"  Barcode: {detected_barcode} → Matched: {matched_barcode}")
+                if expected_code:
+                    print(f"  Three-Code: {detected_code} → Expected: {expected_code}")
+                
+            except Exception as e:
+                processing_time = time.time() - start_time
+                print(f"Error processing {img_name}: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                writer.writerow([
+                    img_name,
+                    detected_barcode if 'detected_barcode' in locals() else "⚠️ Error",
+                    matched_barcode if 'matched_barcode' in locals() else "",
+                    expected_code if 'expected_code' in locals() else "",
+                    detected_code if 'detected_code' in locals() else "⚠️ Error",
+                    "❌",
+                    "❌",
+                    f"{processing_time:.2f}"
+                ])
+        
+        # Calculate success rates
+        barcode_rate = (barcode_match_count / total_count) * 100 if total_count > 0 else 0
+        code_rate = (code_match_count / barcode_match_count) * 100 if barcode_match_count > 0 else 0
+        overall_rate = (overall_success_count / total_count) * 100 if total_count > 0 else 0
+        
+        print("\n=== Results ===")
+        print(f"Total images processed: {total_count}")
+        print(f"Barcode matches: {barcode_match_count}/{total_count} ({barcode_rate:.1f}%)")
+        print(f"Three-segment code matches: {code_match_count}/{barcode_match_count} ({code_rate:.1f}%)")
+        print(f"Overall success: {overall_success_count}/{total_count} ({overall_rate:.1f}%)")
+        print(f"Results saved to: {output_csv}")
+
+# === Full Pipeline ===
+def full_pipeline(input_folder, output_folder, model_path, barcode_data_csv, results_csv, target_class="Target", debug_dir=None):
+    """
+    Run full processing pipeline:
+    1. Detect objects using YOLO
+    2. Crop detected targets
+    3. Process cropped images to extract barcodes and match with expected values
+    
+    Args:
+        input_folder: Folder with original images
+        output_folder: Base folder for outputs
+        model_path: Path to YOLO model
+        barcode_data_csv: CSV with expected barcode and code values
+        results_csv: Path to save results
+        target_class: Class to detect
+        debug_dir: Directory for debug images
+    """
+    # Create output directories
+    create_directory(output_folder)
+    
+    # Create subdirectories
+    detected_folder = os.path.join(output_folder, "detected")
+    cropped_folder = os.path.join(output_folder, "cropped")
     
     # Create debug directory if needed
-    if not os.path.exists(debug_dir):
-        os.makedirs(debug_dir)
+    if debug_dir:
+        create_directory(debug_dir)
     
-    sorting_system.process_batch(input_csv, output_csv, debug_dir)
+    print("\n=== Step 1: YOLO Detection ===")
+    # Detect objects and save images with bounding boxes
+    detect_and_save_images(
+        input_folder, 
+        detected_folder, 
+        model_path,
+        debug_dir
+    )
+    
+    print("\n=== Step 2: Cropping Detected Targets ===")
+    # Crop targets from detected images
+    crop_objects(
+        input_folder,  # Use original images for better quality
+        cropped_folder, 
+        model_path, 
+        target_class,
+        debug_dir
+    )
+    
+    print("\n=== Step 3: Barcode and Code Recognition ===")
+    # Process the cropped labels to extract barcode and three-segment code
+    # Match with entries in barcode_data.csv based on barcode value (not filename)
+    process_cropped_images(
+        cropped_folder,
+        results_csv,
+        barcode_data_csv,
+        debug_dir
+    )
+    
+    print("\n=== Pipeline Complete ===")
+    print(f"📊 Detected images saved to: {detected_folder}")
+    print(f"📊 Cropped targets saved to: {cropped_folder}")
+    print(f"📊 Results saved to: {results_csv}")
+    if debug_dir:
+        print(f"📊 Debug images saved to: {debug_dir}")
+
+# === Main ===
+if __name__ == "__main__":
+    # Configuration
+    input_folder = "label"  # Folder with original images
+    output_folder = "output"  # Base folder for outputs
+    model_path = "best.pt"  # YOLO model path
+    barcode_data_csv = "barcode_data.csv"  # CSV with expected values
+    results_csv = "barcode_result_improved.csv"  # Results CSV
+    debug_dir = "ocr_debug_improved"  # Debug images directory
+    
+    # Run the complete pipeline
+    full_pipeline(
+        input_folder=input_folder,
+        output_folder=output_folder,
+        model_path=model_path,
+        barcode_data_csv=barcode_data_csv,
+        results_csv=results_csv,
+        target_class="Target",
+        debug_dir=debug_dir
+    )
