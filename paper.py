@@ -269,6 +269,7 @@ def detect_and_save_images(input_folder, output_folder, model_path, debug_dir=No
     
     Returns:
     - A list of detected image paths
+    - A dictionary of timing statistics
     """
     # Create output folders
     create_directory(output_folder)
@@ -278,8 +279,12 @@ def detect_and_save_images(input_folder, output_folder, model_path, debug_dir=No
     else:
         yolo_debug_dir = None
     
+    # Timing for model loading
+    model_load_start = time.time()
     # Load model
     model = YOLO(model_path)
+    model_load_time = time.time() - model_load_start
+    print(f"YOLO model loading time: {model_load_time:.3f}s")
     
     # Get list of image files in the input folder
     image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff']
@@ -290,26 +295,54 @@ def detect_and_save_images(input_folder, output_folder, model_path, debug_dir=No
     
     if not image_files:
         print(f"No images found in {input_folder}")
-        return []
+        return [], {"avg": 0, "max": 0, "min": 0, "model_load": model_load_time}
     
     print(f"Found {len(image_files)} images to process with YOLO")
     
     # Process each image
     detected_images = []
+    processing_times = []
+    detection_times = []
+    saving_times = []
+    detailed_timings = {}
+    
     for image_path in image_files:
         image_file = os.path.basename(image_path)
         
         # Construct output paths
         output_path = os.path.join(output_folder, image_file)
         
+        # Measure overall processing time
+        start_time = time.time()
+        
+        # Measure prediction time
+        predict_start = time.time()
         # Perform prediction
         results = model.predict(str(image_path))
+        predict_time = time.time() - predict_start
+        detection_times.append(predict_time)
         
         # Access first result
         result = results[0]
         
+        # Measure saving time
+        save_start = time.time()
         # Save with bounding boxes
         result.save(filename=output_path)
+        save_time = time.time() - save_start
+        saving_times.append(save_time)
+        
+        # Calculate overall processing time
+        end_time = time.time()
+        processing_time = end_time - start_time
+        processing_times.append(processing_time)
+        
+        # Store detailed timing info
+        detailed_timings[image_file] = {
+            "total": processing_time,
+            "detection": predict_time,
+            "saving": save_time
+        }
         
         # Also save to debug directory if specified
         if yolo_debug_dir:
@@ -317,9 +350,60 @@ def detect_and_save_images(input_folder, output_folder, model_path, debug_dir=No
             result.save(filename=debug_path)
         
         detected_images.append(output_path)
-        print(f"YOLO Detection: {image_file}")
+        print(f"YOLO Detection: {image_file} - Total: {processing_time:.3f}s (Detection: {predict_time:.3f}s, Saving: {save_time:.3f}s)")
     
-    return detected_images
+    # Calculate time statistics
+    timing_stats = {}
+    if processing_times:
+        # Overall processing stats
+        avg_time = sum(processing_times) / len(processing_times)
+        max_time = max(processing_times)
+        min_time = min(processing_times)
+        
+        # Detection stats
+        avg_detection = sum(detection_times) / len(detection_times)
+        max_detection = max(detection_times)
+        min_detection = min(detection_times)
+        
+        # Saving stats
+        avg_saving = sum(saving_times) / len(saving_times)
+        max_saving = max(saving_times)
+        min_saving = min(saving_times)
+        
+        print("\n=== YOLO Detection Time Statistics ===")
+        print(f"Average processing time: {avg_time:.3f}s")
+        print(f"Maximum processing time: {max_time:.3f}s")
+        print(f"Minimum processing time: {min_time:.3f}s")
+        
+        print("\n--- Detection Time (YOLO inference) ---")
+        print(f"Average detection time: {avg_detection:.3f}s")
+        print(f"Maximum detection time: {max_detection:.3f}s")
+        print(f"Minimum detection time: {min_detection:.3f}s")
+        
+        print("\n--- Saving Time ---")
+        print(f"Average saving time: {avg_saving:.3f}s")
+        print(f"Maximum saving time: {max_saving:.3f}s")
+        print(f"Minimum saving time: {min_saving:.3f}s")
+        
+        timing_stats = {
+            "avg": avg_time,
+            "max": max_time,
+            "min": min_time,
+            "model_load": model_load_time,
+            "detection": {
+                "avg": avg_detection,
+                "max": max_detection,
+                "min": min_detection
+            },
+            "saving": {
+                "avg": avg_saving,
+                "max": max_saving,
+                "min": min_saving
+            },
+            "detailed": detailed_timings
+        }
+    
+    return detected_images, timing_stats
 
 # === YOLO Crop Function (from yolo_crop_target.py) ===
 def crop_objects(input_folder, output_folder, model_path, target_class="Target", debug_dir=None):
@@ -336,6 +420,7 @@ def crop_objects(input_folder, output_folder, model_path, target_class="Target",
     
     Returns:
     - A list of cropped image paths
+    - A dictionary of timing statistics
     """
     # Create output folders
     create_directory(output_folder)
@@ -345,8 +430,12 @@ def crop_objects(input_folder, output_folder, model_path, target_class="Target",
     else:
         crop_debug_dir = None
     
+    # Timing for model loading
+    model_load_start = time.time()
     # Load YOLOv model
     model = YOLO(model_path)
+    model_load_time = time.time() - model_load_start
+    print(f"YOLO model loading time (crop): {model_load_time:.3f}s")
     
     # Get image files
     image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']
@@ -357,26 +446,45 @@ def crop_objects(input_folder, output_folder, model_path, target_class="Target",
     
     if not image_files:
         print(f"No images found in {input_folder}")
-        return []
+        return [], {"avg": 0, "max": 0, "min": 0, "model_load": model_load_time}
     
     print(f"Found {len(image_files)} images to process for cropping")
     
     # Process each image
     target_count = 0
     cropped_images = []
+    processing_times = []
+    reading_times = []
+    detection_times = []
+    cropping_times = []
+    saving_times = []
+    detailed_timings = {}
+    crops_per_image = {}
     
     for img_path in image_files:
         img_name = os.path.basename(img_path)
         print(f"Processing for crop: {img_name}")
         
+        # Measure overall processing time
+        start_time = time.time()
+        
+        # Measure image reading time
+        read_start = time.time()
         # Read the image
         img = cv2.imread(str(img_path))
+        read_time = time.time() - read_start
+        reading_times.append(read_time)
+        
         if img is None:
             print(f"Error reading image: {img_path}")
             continue
         
+        # Measure detection time
+        detect_start = time.time()
         # Run inference
         results = model(img)
+        detect_time = time.time() - detect_start
+        detection_times.append(detect_time)
         
         # Process results
         result = results[0]  # Get the first result
@@ -393,7 +501,26 @@ def crop_objects(input_folder, output_folder, model_path, target_class="Target",
         
         if not target_indices:
             print(f"No '{target_class}' found in {img_name}")
+            # Still include the processing time even if no targets found
+            end_time = time.time()
+            processing_time = end_time - start_time
+            processing_times.append(processing_time)
+            crops_per_image[img_name] = 0
+            detailed_timings[img_name] = {
+                "total": processing_time,
+                "reading": read_time,
+                "detection": detect_time,
+                "cropping": 0,
+                "saving": 0,
+                "crops": 0
+            }
             continue
+        
+        # Measure cropping and saving time
+        crop_save_start = time.time()
+        crop_time_total = 0
+        save_time_total = 0
+        crops_count = 0
         
         # Crop and save each target object
         for idx, target_idx in enumerate(target_indices):
@@ -409,8 +536,12 @@ def crop_objects(input_folder, output_folder, model_path, target_class="Target",
             x2 = min(width, x2)
             y2 = min(height, y2)
             
+            # Measure crop time
+            crop_start = time.time()
             # Crop the image
             cropped_img = img[y1:y2, x1:x2]
+            crop_time = time.time() - crop_start
+            crop_time_total += crop_time
             
             if cropped_img.size == 0:
                 print(f"Warning: Empty crop in {img_name} at {box}")
@@ -420,7 +551,12 @@ def crop_objects(input_folder, output_folder, model_path, target_class="Target",
             base_name = os.path.splitext(img_name)[0]
             output_name = f"{base_name}_{target_class}_{idx}_{conf:.2f}.jpg"
             output_path = os.path.join(output_folder, output_name)
+            
+            # Measure save time
+            save_start = time.time()
             cv2.imwrite(output_path, cropped_img)
+            save_time = time.time() - save_start
+            save_time_total += save_time
             
             # Also save to debug directory if specified
             if crop_debug_dir:
@@ -429,10 +565,122 @@ def crop_objects(input_folder, output_folder, model_path, target_class="Target",
             
             cropped_images.append(output_path)
             target_count += 1
-            print(f"Saved crop: {output_name}")
+            crops_count += 1
+        
+        # Add average crop and save times
+        if crops_count > 0:
+            cropping_times.append(crop_time_total / crops_count)
+            saving_times.append(save_time_total / crops_count)
+        
+        # Calculate overall processing time
+        end_time = time.time()
+        processing_time = end_time - start_time
+        processing_times.append(processing_time)
+        
+        # Store detailed timing info
+        crops_per_image[img_name] = crops_count
+        detailed_timings[img_name] = {
+            "total": processing_time,
+            "reading": read_time,
+            "detection": detect_time,
+            "cropping": crop_time_total / max(1, crops_count),
+            "saving": save_time_total / max(1, crops_count),
+            "crops": crops_count
+        }
+        
+        print(f"Saved {crops_count} crops from {img_name} - Time: {processing_time:.3f}s")
+    
+    # Calculate time statistics
+    timing_stats = {}
+    if processing_times:
+        # Overall processing stats
+        avg_time = sum(processing_times) / len(processing_times)
+        max_time = max(processing_times)
+        min_time = min(processing_times)
+        
+        print("\n=== Cropping Time Statistics ===")
+        print(f"Average processing time per image: {avg_time:.3f}s")
+        print(f"Maximum processing time per image: {max_time:.3f}s")
+        print(f"Minimum processing time per image: {min_time:.3f}s")
+        
+        # Calculate per-operation stats
+        if reading_times:
+            avg_reading = sum(reading_times) / len(reading_times)
+            max_reading = max(reading_times)
+            min_reading = min(reading_times)
+            
+            print("\n--- Image Reading Time ---")
+            print(f"Average reading time: {avg_reading:.3f}s")
+            print(f"Maximum reading time: {max_reading:.3f}s")
+            print(f"Minimum reading time: {min_reading:.3f}s")
+        
+        if detection_times:
+            avg_detection = sum(detection_times) / len(detection_times)
+            max_detection = max(detection_times)
+            min_detection = min(detection_times)
+            
+            print("\n--- Detection Time ---")
+            print(f"Average detection time: {avg_detection:.3f}s")
+            print(f"Maximum detection time: {max_detection:.3f}s")
+            print(f"Minimum detection time: {min_detection:.3f}s")
+        
+        if cropping_times:
+            avg_cropping = sum(cropping_times) / len(cropping_times)
+            max_cropping = max(cropping_times)
+            min_cropping = min(cropping_times)
+            
+            print("\n--- Cropping Time (per crop) ---")
+            print(f"Average cropping time: {avg_cropping:.3f}s")
+            print(f"Maximum cropping time: {max_cropping:.3f}s")
+            print(f"Minimum cropping time: {min_cropping:.3f}s")
+        
+        if saving_times:
+            avg_saving = sum(saving_times) / len(saving_times)
+            max_saving = max(saving_times)
+            min_saving = min(saving_times)
+            
+            print("\n--- Saving Time (per crop) ---")
+            print(f"Average saving time: {avg_saving:.3f}s")
+            print(f"Maximum saving time: {max_saving:.3f}s")
+            print(f"Minimum saving time: {min_saving:.3f}s")
+        
+        # Average crops per image
+        avg_crops = target_count / len(image_files)
+        print(f"\nAverage crops per image: {avg_crops:.2f}")
+        
+        # Create timing stats dictionary
+        timing_stats = {
+            "avg": avg_time,
+            "max": max_time,
+            "min": min_time,
+            "model_load": model_load_time,
+            "reading": {
+                "avg": avg_reading if reading_times else 0,
+                "max": max_reading if reading_times else 0,
+                "min": min_reading if reading_times else 0
+            },
+            "detection": {
+                "avg": avg_detection if detection_times else 0,
+                "max": max_detection if detection_times else 0,
+                "min": min_detection if detection_times else 0
+            },
+            "cropping": {
+                "avg": avg_cropping if cropping_times else 0,
+                "max": max_cropping if cropping_times else 0,
+                "min": min_cropping if cropping_times else 0
+            },
+            "saving": {
+                "avg": avg_saving if saving_times else 0,
+                "max": max_saving if saving_times else 0,
+                "min": min_saving if saving_times else 0
+            },
+            "crops_per_image": crops_per_image,
+            "avg_crops_per_image": avg_crops,
+            "detailed": detailed_timings
+        }
     
     print(f"Cropping complete. Found and saved {target_count} '{target_class}' objects.")
-    return cropped_images
+    return cropped_images, timing_stats
 
 # === Process Cropped Images Function (matches barcodes from cropped images) ===
 def process_cropped_images(cropped_folder, output_csv, barcode_data_csv, debug_dir=None):
@@ -500,6 +748,7 @@ def process_cropped_images(cropped_folder, output_csv, barcode_data_csv, debug_d
         barcode_match_count = 0
         code_match_count = 0
         overall_success_count = 0
+        processing_times = []
         
         # Process each image
         for img_path in image_files:
@@ -611,6 +860,7 @@ def process_cropped_images(cropped_folder, output_csv, barcode_data_csv, debug_d
                 
                 # Determine match status
                 processing_time = time.time() - start_time
+                processing_times.append(processing_time)
                 
                 # Determine if barcode matched
                 barcode_match = "❌"
@@ -639,17 +889,18 @@ def process_cropped_images(cropped_folder, output_csv, barcode_data_csv, debug_d
                     detected_code,
                     barcode_match,
                     code_match,
-                    f"{processing_time:.2f}"
+                    f"{processing_time:.3f}"
                 ])
                 
                 # Log to console
-                print(f"[{barcode_match}|{code_match}] {img_name}")
+                print(f"[{barcode_match}|{code_match}] {img_name} - Time: {processing_time:.3f}s")
                 print(f"  Barcode: {detected_barcode} → Matched: {matched_barcode}")
                 if expected_code:
                     print(f"  Three-Code: {detected_code} → Expected: {expected_code}")
                 
             except Exception as e:
                 processing_time = time.time() - start_time
+                processing_times.append(processing_time)
                 print(f"Error processing {img_name}: {str(e)}")
                 import traceback
                 traceback.print_exc()
@@ -669,11 +920,25 @@ def process_cropped_images(cropped_folder, output_csv, barcode_data_csv, debug_d
         code_rate = (code_match_count / barcode_match_count) * 100 if barcode_match_count > 0 else 0
         overall_rate = (overall_success_count / total_count) * 100 if total_count > 0 else 0
         
+        # Calculate time statistics
+        if processing_times:
+            avg_time = sum(processing_times) / len(processing_times)
+            max_time = max(processing_times)
+            min_time = min(processing_times)
+        else:
+            avg_time = max_time = min_time = 0
+        
         print("\n=== Results ===")
         print(f"Total images processed: {total_count}")
         print(f"Barcode matches: {barcode_match_count}/{total_count} ({barcode_rate:.1f}%)")
         print(f"Three-segment code matches: {code_match_count}/{barcode_match_count} ({code_rate:.1f}%)")
         print(f"Overall success: {overall_success_count}/{total_count} ({overall_rate:.1f}%)")
+        
+        print("\n=== Processing Time Statistics ===")
+        print(f"Average processing time: {avg_time:.3f}s")
+        print(f"Maximum processing time: {max_time:.3f}s")
+        print(f"Minimum processing time: {min_time:.3f}s")
+        
         print(f"Results saved to: {output_csv}")
 
 # === Full Pipeline ===
@@ -704,26 +969,38 @@ def full_pipeline(input_folder, output_folder, model_path, barcode_data_csv, res
     if debug_dir:
         create_directory(debug_dir)
     
+    # Dictionary to store all timing statistics
+    pipeline_stats = {}
+    
     print("\n=== Step 1: YOLO Detection ===")
+    yolo_start = time.time()
     # Detect objects and save images with bounding boxes
-    detect_and_save_images(
+    detected_images, yolo_stats = detect_and_save_images(
         input_folder, 
         detected_folder, 
         model_path,
         debug_dir
     )
+    yolo_total = time.time() - yolo_start
+    pipeline_stats["yolo"] = yolo_stats
+    pipeline_stats["yolo"]["total_time"] = yolo_total
     
     print("\n=== Step 2: Cropping Detected Targets ===")
+    crop_start = time.time()
     # Crop targets from detected images
-    crop_objects(
+    cropped_images, crop_stats = crop_objects(
         input_folder,  # Use original images for better quality
         cropped_folder, 
         model_path, 
         target_class,
         debug_dir
     )
+    crop_total = time.time() - crop_start
+    pipeline_stats["crop"] = crop_stats
+    pipeline_stats["crop"]["total_time"] = crop_total
     
     print("\n=== Step 3: Barcode and Code Recognition ===")
+    barcode_start = time.time()
     # Process the cropped labels to extract barcode and three-segment code
     # Match with entries in barcode_data.csv based on barcode value (not filename)
     process_cropped_images(
@@ -732,6 +1009,18 @@ def full_pipeline(input_folder, output_folder, model_path, barcode_data_csv, res
         barcode_data_csv,
         debug_dir
     )
+    barcode_total = time.time() - barcode_start
+    
+    total_time = yolo_total + crop_total + barcode_total
+    pipeline_stats["barcode"] = {"total_time": barcode_total}
+    pipeline_stats["total_time"] = total_time
+    
+    # Calculate per-image processing time across the whole pipeline
+    if detected_images and cropped_images:
+        unique_source_images = set([os.path.splitext(os.path.basename(path))[0].split('_')[0] 
+                                   for path in detected_images + cropped_images])
+        avg_time_per_image = total_time / len(unique_source_images) if unique_source_images else 0
+        pipeline_stats["avg_time_per_image"] = avg_time_per_image
     
     print("\n=== Pipeline Complete ===")
     print(f"📊 Detected images saved to: {detected_folder}")
@@ -739,6 +1028,80 @@ def full_pipeline(input_folder, output_folder, model_path, barcode_data_csv, res
     print(f"📊 Results saved to: {results_csv}")
     if debug_dir:
         print(f"📊 Debug images saved to: {debug_dir}")
+    
+    print("\n=== Overall Processing Time ===")
+    print(f"YOLO Detection: {yolo_total:.2f}s")
+    print(f"Target Cropping: {crop_total:.2f}s")
+    print(f"Barcode Processing: {barcode_total:.2f}s")
+    print(f"Total Pipeline Time: {total_time:.2f}s")
+    
+    # If we have processed images, calculate the average time per image
+    if "avg_time_per_image" in pipeline_stats:
+        print(f"Average time per source image: {pipeline_stats['avg_time_per_image']:.2f}s")
+    
+    # Write timing statistics to CSV
+    try:
+        stats_csv = os.path.join(output_folder, "timing_statistics.csv")
+        with open(stats_csv, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(["Process", "Average Time (s)", "Maximum Time (s)", "Minimum Time (s)"])
+            
+            # YOLO detection stats
+            writer.writerow(["YOLO Detection (total)", 
+                            f"{yolo_stats.get('avg', 0):.3f}", 
+                            f"{yolo_stats.get('max', 0):.3f}", 
+                            f"{yolo_stats.get('min', 0):.3f}"])
+            
+            if "detection" in yolo_stats:
+                writer.writerow(["YOLO Inference", 
+                                f"{yolo_stats['detection'].get('avg', 0):.3f}", 
+                                f"{yolo_stats['detection'].get('max', 0):.3f}", 
+                                f"{yolo_stats['detection'].get('min', 0):.3f}"])
+            
+            if "saving" in yolo_stats:
+                writer.writerow(["YOLO Result Saving", 
+                                f"{yolo_stats['saving'].get('avg', 0):.3f}", 
+                                f"{yolo_stats['saving'].get('max', 0):.3f}", 
+                                f"{yolo_stats['saving'].get('min', 0):.3f}"])
+            
+            # Cropping stats
+            writer.writerow(["Cropping (total)", 
+                            f"{crop_stats.get('avg', 0):.3f}", 
+                            f"{crop_stats.get('max', 0):.3f}", 
+                            f"{crop_stats.get('min', 0):.3f}"])
+            
+            if "reading" in crop_stats:
+                writer.writerow(["Image Reading", 
+                                f"{crop_stats['reading'].get('avg', 0):.3f}", 
+                                f"{crop_stats['reading'].get('max', 0):.3f}", 
+                                f"{crop_stats['reading'].get('min', 0):.3f}"])
+            
+            if "detection" in crop_stats:
+                writer.writerow(["Target Detection", 
+                                f"{crop_stats['detection'].get('avg', 0):.3f}", 
+                                f"{crop_stats['detection'].get('max', 0):.3f}", 
+                                f"{crop_stats['detection'].get('min', 0):.3f}"])
+            
+            if "cropping" in crop_stats:
+                writer.writerow(["Image Cropping", 
+                                f"{crop_stats['cropping'].get('avg', 0):.3f}", 
+                                f"{crop_stats['cropping'].get('max', 0):.3f}", 
+                                f"{crop_stats['cropping'].get('min', 0):.3f}"])
+            
+            if "saving" in crop_stats:
+                writer.writerow(["Crop Saving", 
+                                f"{crop_stats['saving'].get('avg', 0):.3f}", 
+                                f"{crop_stats['saving'].get('max', 0):.3f}", 
+                                f"{crop_stats['saving'].get('min', 0):.3f}"])
+            
+            # Overall pipeline stats
+            writer.writerow(["Total Pipeline", f"{total_time:.3f}", "", ""])
+        
+        print(f"📊 Timing statistics saved to: {stats_csv}")
+    except Exception as e:
+        print(f"Error saving timing statistics: {str(e)}")
+        
+    return pipeline_stats
 
 # === Main ===
 if __name__ == "__main__":
@@ -750,8 +1113,11 @@ if __name__ == "__main__":
     results_csv = "barcode_result.csv"  # Results CSV
     debug_dir = "ocr_debug"  # Debug images directory
     
+    # Start timing the entire process
+    overall_start_time = time.time()
+    
     # Run the complete pipeline
-    full_pipeline(
+    pipeline_stats = full_pipeline(
         input_folder=input_folder,
         output_folder=output_folder,
         model_path=model_path,
@@ -760,3 +1126,27 @@ if __name__ == "__main__":
         target_class="Target",
         debug_dir=debug_dir
     )
+    
+    # Calculate total execution time
+    overall_execution_time = time.time() - overall_start_time
+    
+    print(f"\n=== Script Complete ===")
+    print(f"Total execution time: {overall_execution_time:.3f}s")
+    
+    # Create a visual summary with timing breakdown
+    print("\n=== Time Breakdown Summary ===")
+    yolo_time = pipeline_stats.get("yolo", {}).get("total_time", 0)
+    crop_time = pipeline_stats.get("crop", {}).get("total_time", 0)
+    barcode_time = pipeline_stats.get("barcode", {}).get("total_time", 0)
+    
+    # Calculate percentages
+    total_pipeline_time = yolo_time + crop_time + barcode_time
+    yolo_percent = (yolo_time / total_pipeline_time) * 100 if total_pipeline_time > 0 else 0
+    crop_percent = (crop_time / total_pipeline_time) * 100 if total_pipeline_time > 0 else 0
+    barcode_percent = (barcode_time / total_pipeline_time) * 100 if total_pipeline_time > 0 else 0
+    
+    # Print simple bar chart
+    print(f"YOLO Detection  : {yolo_time:.3f}s ({yolo_percent:.1f}%) {'█' * int(yolo_percent / 2)}")
+    print(f"Target Cropping : {crop_time:.3f}s ({crop_percent:.1f}%) {'█' * int(crop_percent / 2)}")
+    print(f"Barcode Process : {barcode_time:.3f}s ({barcode_percent:.1f}%) {'█' * int(barcode_percent / 2)}")
+    print(f"Total Pipeline  : {total_pipeline_time:.3f}s")
