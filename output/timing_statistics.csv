@@ -1,11 +1,10 @@
 Process,Average Time (s),Maximum Time (s),Minimum Time (s)
-YOLO Detection (total),0.151,0.778,0.102
-YOLO Inference,0.143,0.765,0.096
-YOLO Result Saving,0.007,0.070,0.005
-Cropping (total),0.154,0.452,0.097
-Image Reading,0.007,0.023,0.005
-Target Detection,0.145,0.444,0.088
-Image Cropping,0.000,0.000,0.000
-Crop Saving,0.001,0.010,0.001
-Total Pipeline,165.423,,
-Average Per Source Image,165.423,,
+YOLO Detection (total),0.132,0.990,0.092
+YOLO Inference,0.125,0.978,0.087
+YOLO Result Saving,0.007,0.094,0.005
+Cropping (total),0.128,0.726,0.089
+Image Reading,0.005,0.011,0.005
+Target Detection,0.120,0.719,0.081
+Image Cropping,0.000,0.001,0.000
+Crop Saving,0.001,0.003,0.001
+Total Pipeline,151.880,,
